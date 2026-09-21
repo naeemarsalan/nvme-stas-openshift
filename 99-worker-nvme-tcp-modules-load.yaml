@@ -1,0 +1,41 @@
+# Day-2 MachineConfig: make nvme_tcp (and its dependency nvme_fabrics) load at every boot.
+# This is a plain /etc file write - NOT image layering, NOT an RHCOS rebuild.
+# Applying it drains and reboots the pool once ("the node drains off its pods, applies
+# the update, and reboots" - OCP 4.20 Machine configuration guide). After that it is free.
+#
+# Butane equivalent (variant: openshift / version: 4.20.0), same shape as the documented
+# 99-worker-chrony example in the OCP 4.20 docs:
+#
+#   variant: openshift
+#   version: 4.20.0
+#   metadata:
+#     name: 99-worker-nvme-tcp
+#     labels:
+#       machineconfiguration.openshift.io/role: worker
+#   storage:
+#     files:
+#       - path: /etc/modules-load.d/nvme-tcp.conf
+#         mode: 0644
+#         overwrite: true
+#         contents:
+#           inline: |
+#             nvme_tcp
+#
+# Rendered MachineConfig:
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-worker-nvme-tcp
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  config:
+    ignition:
+      version: 3.5.0
+    storage:
+      files:
+        - path: /etc/modules-load.d/nvme-tcp.conf
+          mode: 420          # 0644
+          overwrite: true
+          contents:
+            source: data:,nvme_tcp%0A

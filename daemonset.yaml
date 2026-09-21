@@ -1,0 +1,128 @@
+# nvme-stas as a DaemonSet on OpenShift / RHCOS
+#
+# Delivers stafd + stacd (NVMe-oF Centralized Discovery Controller client) to RHCOS
+# worker nodes WITHOUT modifying the node image. RHCOS does not ship nvme-stas and has
+# no runtime package manager; this is the container-delivered alternative to RHCOS
+# image layering.
+#
+# Verified running on OpenShift 4.20.32 / RHCOS 9.6 (3 nodes).
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nvme-stas
+  namespace: nvme-stas
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nvme-stas-conf
+  namespace: nvme-stas
+data:
+  # zeroconf=disabled means no Avahi daemon is needed. With a Centralized Discovery Controller at a known
+  # address you list it statically under [Controllers]. This also removes the entire
+  # avahi/cairo/libX11/freetype dependency closure from the argument, because in a
+  # container those are image bytes, not node bytes.
+  stafd.conf: |
+    [Global]
+    tron=false
+    persistent-connections=true
+    [Service Discovery]
+    zeroconf=disabled
+    [Controllers]
+    # controller = transport=tcp;traddr=<cdc-ip>;trsvcid=8009
+  stacd.conf: |
+    [Global]
+    tron=false
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvme-stas
+  namespace: nvme-stas
+spec:
+  selector:
+    matchLabels: {app: nvme-stas}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app: nvme-stas}
+      annotations:
+        openshift.io/required-scc: privileged
+    spec:
+      serviceAccountName: nvme-stas
+      # MANDATORY, for two independent reasons:
+      #  1. staslib/udev.py uses pyudev Monitor.from_netlink(source='udev'). systemd-udevd
+      #     rebroadcasts to that group only in the host netns. In a pod netns stafd is
+      #     permanently deaf to NVME_AEN=0x70f002 DISCOVERY_LOG_CHANGE, silently.
+      #  2. nvme_tcp_alloc_queue() calls sock_create_kern(current->nsproxy->net_ns).
+      #     Kernel-driven reconnects run on a kworker with init_nsproxy, so a connection
+      #     first made in a pod netns would reconnect from a different source address.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # hostPID / hostIPC are NOT needed. Omitting them also lets dbus-daemon --system
+      # drop capabilities normally; with hostPID it fails with
+      # "Failed to drop capabilities: Operation not permitted".
+      tolerations:
+        - operator: Exists
+      initContainers:
+        # nvme_fabrics must be present before stafd's os.path.exists('/dev/nvme-fabrics')
+        # check. The kernel autoloads nvme_tcp on first connect, but stafd checks at start.
+        - name: load-nvme-tcp
+          image: ghcr.io/OWNER/nvme-stas:2.2.1-el9
+          command: ["/bin/sh","-c","modprobe -v nvme_tcp || modprobe -v nvme_fabrics"]
+          securityContext: {privileged: true}
+          volumeMounts:
+            - {name: modules, mountPath: /usr/lib/modules, readOnly: true}
+        # Fail loudly rather than presenting a cluster-wide-identical NQN to the array.
+        - name: check-host-identity
+          image: ghcr.io/OWNER/nvme-stas:2.2.1-el9
+          command:
+            - /bin/sh
+            - -c
+            - |
+              [ -s /etc/nvme/hostnqn ] || { echo "FATAL: node /etc/nvme/hostnqn is missing or empty"; exit 1; }
+              echo "host NQN: $(cat /etc/nvme/hostnqn)"
+          securityContext: {privileged: true}
+          volumeMounts:
+            - {name: etc-nvme, mountPath: /etc/nvme}
+      containers:
+        - name: nvme-stas
+          image: ghcr.io/OWNER/nvme-stas:2.2.1-el9
+          # Pin a digest in production. A mutable tag with the default IfNotPresent policy
+          # means a rebuilt image silently never rolls out.
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          env:
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: XDG_CACHE_HOME, value: /var/cache/stafd}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","rm -f /run/udev/rules.d/70-nvmf-autoconnect.rules"]
+          volumeMounts:
+            - {name: dev, mountPath: /dev}
+            - {name: sys, mountPath: /sys}
+            - {name: modules, mountPath: /usr/lib/modules, readOnly: true}
+            # Node NVMe identity. Without this the pod uses the image's NQN.
+            - {name: etc-nvme, mountPath: /etc/nvme}
+            # stafd writes its autoconnect-suppression rule here and must be able to remove it.
+            - {name: run-udev, mountPath: /run/udev}
+            # NOT emptyDir: stacd adopts existing kernel connections only if they appear in
+            # last-known-config.pickle. An emptyDir is wiped on restart, so after a rollout
+            # stacd owns nothing while the previous connections stay live and unreaped.
+            - {name: run-stafd, mountPath: /run/stafd}
+            - {name: run-stacd, mountPath: /run/stacd}
+            - {name: conf, mountPath: /etc/stas}
+      volumes:
+        - {name: dev,       hostPath: {path: /dev,             type: Directory}}
+        - {name: sys,       hostPath: {path: /sys,             type: Directory}}
+        - {name: modules,   hostPath: {path: /usr/lib/modules, type: Directory}}
+        - {name: etc-nvme,  hostPath: {path: /etc/nvme,        type: Directory}}
+        - {name: run-udev,  hostPath: {path: /run/udev,        type: Directory}}
+        - {name: run-stafd, hostPath: {path: /run/stafd,       type: DirectoryOrCreate}}
+        - {name: run-stacd, hostPath: {path: /run/stacd,       type: DirectoryOrCreate}}
+        - {name: conf,      configMap: {name: nvme-stas-conf}}
