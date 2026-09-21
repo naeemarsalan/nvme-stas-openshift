@@ -117,6 +117,15 @@ a reboot, which is when the connections die anyway.
 **`zeroconf=disabled`** unless you actually need mDNS. It removes the Avahi dependency,
 and with it the reason the RPM's closure is so large.
 
+## A version skew to be aware of
+
+RHCOS 4.20.22 ships `nvme-cli 2.11-7.el9_6` and `libnvme 1.11.1`, built from RHEL 9.6
+content. Current RHEL 9 AppStream is at `nvme-cli 2.16-1.el9`, so a container built from
+it carries a newer nvme-cli and libnvme than the node does. `stacd` acts on the host
+kernel through `/dev/nvme-fabrics` via libnvme, so the userspace doing the connecting is
+the container's, not the node's. That worked in testing, but it is a real boundary and
+worth checking against your own kernel and array.
+
 ## Why restarts are safe
 
 `Stac._keep_connections_on_exit()` returns `True` in 2.2.1. On SIGTERM `stacd` drops its
@@ -134,9 +143,18 @@ podman build -t ghcr.io/OWNER/nvme-stas:2.2.1-el9 .
 podman push ghcr.io/OWNER/nvme-stas:2.2.1-el9
 ```
 
-For production, swap the CentOS Stream repos in the `Containerfile` for your entitled
-RHEL 9 AppStream and BaseOS repos, and pin an image digest rather than a tag. A mutable
-tag with the default `IfNotPresent` policy means a rebuilt image silently never rolls out.
+**Build on an entitled RHEL host.** nvme-stas is in `rhel-9-for-x86_64-appstream-rpms`
+and is *not* in the `ubi-9-*` repos, so a plain unentitled UBI build cannot reach it.
+On an entitled host podman bind-mounts `/etc/pki/entitlement` and the RHEL repos resolve,
+giving you `vendor=Red Hat, Inc.` signed packages. This is the same requirement OpenShift
+documents for layering RHEL packages onto RHCOS.
+
+The `Containerfile` carries a commented CentOS Stream fallback for labs without
+entitlement. It pulls the same NVRAs, but they come out `vendor=CentOS` with `gpgcheck=0`,
+so most land unsigned. Do not ship that build.
+
+Pin an image digest rather than a tag. A mutable tag with the default `IfNotPresent`
+policy means a rebuilt image silently never rolls out.
 
 Deploy:
 
